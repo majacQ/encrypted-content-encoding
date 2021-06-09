@@ -12,20 +12,13 @@
  *
  * aesgcm: The version that is widely deployed with WebPush (as of 2016-11).
  *    This version is selected by default, unless you specify a |padSize| of 1.
- *
- * aesgcm128: This version is old and will be removed in an upcoming release.
- *     This version is selected by providing a |padSize| parameter of 1.
  */
 
 var crypto = require('crypto');
 var base64 = require('urlsafe-base64');
 
-var saved = {
-  keymap: {},
-  keylabels: {}
-};
 var AES_GCM = 'aes-128-gcm';
-var PAD_SIZE = { 'aes128gcm': 2, 'aesgcm': 2, 'aesgcm128': 1 };
+var PAD_SIZE = { 'aes128gcm': 1, 'aesgcm': 2 };
 var TAG_LENGTH = 16;
 var KEY_LENGTH = 16;
 var NONCE_LENGTH = 12;
@@ -67,11 +60,11 @@ function HKDF_extract(salt, ikm) {
 function HKDF_expand(prk, info, l) {
   keylog('prk', prk);
   keylog('info', info);
-  var output = new Buffer(0);
-  var T = new Buffer(0);
-  info = new Buffer(info, 'ascii');
+  var output = Buffer.alloc(0);
+  var T = Buffer.alloc(0);
+  info = Buffer.from(info, 'ascii');
   var counter = 0;
-  var cbuf = new Buffer(1);
+  var cbuf = Buffer.alloc(1);
   while (output.length < l) {
     cbuf.writeUIntBE(++counter, 0, 1);
     T = HMAC_hash(prk, Buffer.concat([T, info, cbuf]));
@@ -87,7 +80,7 @@ function HKDF(salt, ikm, info, len) {
 
 function info(base, context) {
   var result = Buffer.concat([
-    new Buffer('Content-Encoding: ' + base + '\0', 'ascii'),
+    Buffer.from('Content-Encoding: ' + base + '\0', 'ascii'),
     context
   ]);
   keylog('info ' + base, result);
@@ -95,22 +88,13 @@ function info(base, context) {
 }
 
 function lengthPrefix(buffer) {
-  var b = Buffer.concat([new Buffer(2), buffer]);
+  var b = Buffer.concat([Buffer.alloc(2), buffer]);
   b.writeUIntBE(buffer.length, 0, 2);
   return b;
 }
 
 function extractDH(header, mode) {
   var key = header.privateKey;
-  if (!key) {
-    if (!header.keymap || !header.keyid || !header.keymap[header.keyid]) {
-      throw new Error('No known DH key for ' + header.keyid);
-    }
-    key = header.keymap[header.keyid];
-  }
-  if (!header.keylabels[header.keyid]) {
-    throw new Error('No known DH key label for ' + header.keyid);
-  }
   var senderPubKey, receiverPubKey;
   if (mode === MODE_ENCRYPT) {
     senderPubKey = key.getPublicKey();
@@ -125,7 +109,7 @@ function extractDH(header, mode) {
   return {
     secret: key.computeSecret(header.dh),
     context: Buffer.concat([
-      decode(header.keylabels[header.keyid]),
+      Buffer.from(header.keylabel, 'ascii'),
       Buffer.from([0]),
       lengthPrefix(receiverPubKey), // user agent
       lengthPrefix(senderPubKey)    // application server
@@ -134,7 +118,7 @@ function extractDH(header, mode) {
 }
 
 function extractSecretAndContext(header, mode) {
-  var result = { secret: null, context: new Buffer(0) };
+  var result = { secret: null, context: Buffer.alloc(0) };
   if (header.key) {
     result.secret = header.key;
     if (result.secret.length !== KEY_LENGTH) {
@@ -152,7 +136,7 @@ function extractSecretAndContext(header, mode) {
   keylog('context', result.context);
   if (header.authSecret) {
     result.secret = HKDF(header.authSecret, result.secret,
-                         info('auth', new Buffer(0)), SHA_256_LENGTH);
+                         info('auth', Buffer.alloc(0)), SHA_256_LENGTH);
     keylog('authsecret', result.secret);
   }
   return result;
@@ -189,7 +173,13 @@ function webpushSecret(header, mode) {
                      SHA_256_LENGTH));
 }
 
-function extractSecret(header, mode) {
+function extractSecret(header, mode, keyLookupCallback) {
+  if (keyLookupCallback) {
+    if (!isFunction(keyLookupCallback)) {
+      throw new Error('Callback is not a function')
+    }
+  }
+
   if (header.key) {
     if (header.key.length !== KEY_LENGTH) {
       throw new Error('An explicit key must be ' + KEY_LENGTH + ' bytes');
@@ -199,7 +189,11 @@ function extractSecret(header, mode) {
 
   if (!header.privateKey) {
     // Lookup based on keyid
-    var key = header.keymap && header.keymap[header.keyid];
+    if (!keyLookupCallback) {
+      var key = header.keymap && header.keymap[header.keyid];
+    } else {
+      var key = keyLookupCallback(header.keyid)
+    }
     if (!key) {
       throw new Error('No saved key (keyid: "' + header.keyid + '")');
     }
@@ -209,21 +203,16 @@ function extractSecret(header, mode) {
   return webpushSecret(header, mode);
 }
 
-function deriveKeyAndNonce(header, mode) {
+function deriveKeyAndNonce(header, mode, lookupKeyCallback) {
   if (!header.salt) {
     throw new Error('must include a salt parameter for ' + header.version);
   }
   var keyInfo;
   var nonceInfo;
   var secret;
-  if (header.version === 'aesgcm128') {
-    // really old
-    keyInfo = 'Content-Encoding: aesgcm128';
-    nonceInfo = 'Content-Encoding: nonce';
-    secret = extractSecretAndContext(header, mode).secret;
-  } else if (header.version === 'aesgcm') {
+  if (header.version === 'aesgcm') {
     // old
-    var s = extractSecretAndContext(header, mode);
+    var s = extractSecretAndContext(header, mode, lookupKeyCallback);
     keyInfo = info('aesgcm', s.context);
     nonceInfo = info('nonce', s.context);
     secret = s.secret;
@@ -231,9 +220,9 @@ function deriveKeyAndNonce(header, mode) {
     // latest
     keyInfo = Buffer.from('Content-Encoding: aes128gcm\0');
     nonceInfo = Buffer.from('Content-Encoding: nonce\0');
-    secret = extractSecret(header, mode);
+    secret = extractSecret(header, mode, lookupKeyCallback);
   } else {
-    throw new Error('Unable to set context for mode ' + params.version);
+    throw new Error('Unable to set context for mode ' + header.version);
   }
   var prk = HKDF_extract(header.salt, secret);
   var result = {
@@ -248,19 +237,18 @@ function deriveKeyAndNonce(header, mode) {
 /* Parse command-line arguments. */
 function parseParams(params) {
   var header = {};
-  if (params.version) {
-    header.version = params.version;
-  } else {
-    header.version = (params.padSize === 1) ? 'aesgcm128' : 'aesgcm';
-  }
 
+  header.version = params.version || 'aes128gcm';
   header.rs = parseInt(params.rs, 10);
   if (isNaN(header.rs)) {
     header.rs = 4096;
   }
-  if (header.rs <= PAD_SIZE[header.version]) {
-    throw new Error('The rs parameter has to be greater than ' +
-                    PAD_SIZE[header.version]);
+  var overhead = PAD_SIZE[header.version];
+  if (header.version === 'aes128gcm') {
+    overhead += TAG_LENGTH;
+  }
+  if (header.rs <= overhead) {
+    throw new Error('The rs parameter has to be greater than ' + overhead);
   }
 
   if (params.salt) {
@@ -275,10 +263,10 @@ function parseParams(params) {
   } else {
     header.privateKey = params.privateKey;
     if (!header.privateKey) {
-      header.keymap = params.keymap || saved.keymap;
+      header.keymap = params.keymap;
     }
     if (header.version !== 'aes128gcm') {
-      header.keylabels = params.keylabels || saved.keylabels;
+      header.keylabel = params.keylabel || 'P-256';
     }
     if (params.dh) {
       header.dh = decode(params.dh);
@@ -291,7 +279,7 @@ function parseParams(params) {
 }
 
 function generateNonce(base, counter) {
-  var nonce = new Buffer(base);
+  var nonce = Buffer.from(base);
   var m = nonce.readUIntBE(nonce.length - 6, 6);
   var x = ((m ^ counter) & 0xffffff) +
       ((((m / 0x1000000) ^ (counter / 0x1000000)) & 0xffffff) * 0x1000000);
@@ -310,21 +298,14 @@ function readHeader(buffer, header) {
   return 21 + idsz;
 }
 
-function decryptRecord(key, counter, buffer, header) {
-  keylog('decrypt', buffer);
-  var nonce = generateNonce(key.nonce, counter);
-  var gcm = crypto.createDecipheriv(AES_GCM, key.key, nonce);
-  gcm.setAuthTag(buffer.slice(buffer.length - TAG_LENGTH));
-  var data = gcm.update(buffer.slice(0, buffer.length - TAG_LENGTH));
-  data = Buffer.concat([data, gcm.final()]);
-  keylog('decrypted', data);
-  var padSize = PAD_SIZE[header.version];
+function unpadLegacy(data, version) {
+  var padSize = PAD_SIZE[version];
   var pad = data.readUIntBE(0, padSize);
   if (pad + padSize > data.length) {
     throw new Error('padding exceeds block size');
   }
   keylog('padding', data.slice(0, padSize + pad));
-  var padCheck = new Buffer(pad);
+  var padCheck = Buffer.alloc(pad);
   padCheck.fill(0);
   if (padCheck.compare(data.slice(padSize, padSize + pad)) !== 0) {
     throw new Error('invalid padding');
@@ -332,42 +313,74 @@ function decryptRecord(key, counter, buffer, header) {
   return data.slice(padSize + pad);
 }
 
-// TODO: this really should use the node streams stuff
+function unpad(data, last) {
+  var i = data.length - 1;
+  while(i >= 0) {
+    if (data[i]) {
+      if (last) {
+        if (data[i] !== 2) {
+          throw new Error('last record needs to start padding with a 2');
+        }
+      } else {
+        if (data[i] !== 1) {
+          throw new Error('last record needs to start padding with a 2');
+        }
+      }
+      return data.slice(0, i);
+    }
+    --i;
+  }
+  throw new Error('all zero plaintext');
+}
+
+function decryptRecord(key, counter, buffer, header, last) {
+  keylog('decrypt', buffer);
+  var nonce = generateNonce(key.nonce, counter);
+  var gcm = crypto.createDecipheriv(AES_GCM, key.key, nonce);
+  gcm.setAuthTag(buffer.slice(buffer.length - TAG_LENGTH));
+  var data = gcm.update(buffer.slice(0, buffer.length - TAG_LENGTH));
+  data = Buffer.concat([data, gcm.final()]);
+  keylog('decrypted', data);
+  if (header.version !== 'aes128gcm') {
+    return unpadLegacy(data, header.version);
+  }
+  return unpad(data, last);
+}
 
 /**
  * Decrypt some bytes.  This uses the parameters to determine the key and block
  * size, which are described in the draft.  Binary values are base64url encoded.
  *
  * |params.version| contains the version of encoding to use: aes128gcm is the latest,
- * but aesgcm and aesgcm128 are also accepted (though the latter two might
- * disappear in a future release).  If omitted, assume aesgcm, unless
- * |params.padSize| is set to 1, which means aesgcm128.
+ * but aesgcm is also accepted (though the latter might
+ * disappear in a future release).  If omitted, assume aes128gcm.
  *
  * If |params.key| is specified, that value is used as the key.
  *
- * If |params.keyid| is specified without |params.dh|, the keyid value is used
- * to lookup the |params.keymap| for a buffer containing the key.
+ * If the version is aes128gcm, the keyid is extracted from the header and used
+ * as the ECDH public key of the sender.  For version aesgcm ,
+ * |params.dh| needs to be provided with the public key of the sender.
  *
- * For version aesgcm and aesgcm128, |params.dh| includes the public key of the sender.  The ECDH key
- * pair used to decrypt is looked up using |params.keymap[params.keyid]|.
- *
- * Version aes128gcm is stricter.  The |params.privateKey| includes the private
- * key of the receiver.  The keyid is extracted from the header and used as the
- * ECDH public key of the sender.
+ * The |params.privateKey| includes the private key of the receiver.
  */
-function decrypt(buffer, params) {
+function decrypt(buffer, params, keyLookupCallback) {
   var header = parseParams(params);
   if (header.version === 'aes128gcm') {
     var headerLength = readHeader(buffer, header);
     buffer = buffer.slice(headerLength);
   }
-  var key = deriveKeyAndNonce(header, MODE_DECRYPT);
+  var key = deriveKeyAndNonce(header, MODE_DECRYPT, keyLookupCallback);
   var start = 0;
-  var result = new Buffer(0);
+  var result = Buffer.alloc(0);
+
+  var chunkSize = header.rs;
+  if (header.version !== 'aes128gcm') {
+    chunkSize += TAG_LENGTH;
+  }
 
   for (var i = 0; start < buffer.length; ++i) {
-    var end = start + header.rs + TAG_LENGTH;
-    if (end === buffer.length) {
+    var end = start + chunkSize;
+    if (header.version !== 'aes128gcm' && end === buffer.length) {
       throw new Error('Truncated payload');
     }
     end = Math.min(end, buffer.length);
@@ -375,34 +388,51 @@ function decrypt(buffer, params) {
       throw new Error('Invalid block: too small at ' + i);
     }
     var block = decryptRecord(key, i, buffer.slice(start, end),
-                              header);
+                              header, end >= buffer.length);
     result = Buffer.concat([result, block]);
     start = end;
   }
   return result;
 }
 
-function encryptRecord(key, counter, buffer, pad, padSize) {
+function encryptRecord(key, counter, buffer, pad, header, last) {
   keylog('encrypt', buffer);
   pad = pad || 0;
   var nonce = generateNonce(key.nonce, counter);
   var gcm = crypto.createCipheriv(AES_GCM, key.key, nonce);
-  var padding = new Buffer(pad + padSize);
+
+  var ciphertext = [];
+  var padSize = PAD_SIZE[header.version];
+  var padding = Buffer.alloc(pad + padSize);
   padding.fill(0);
-  padding.writeUIntBE(pad, 0, padSize);
-  keylog('padding', padding);
-  var epadding = gcm.update(padding);
-  var ebuffer = gcm.update(buffer);
+
+  if (header.version !== 'aes128gcm') {
+    padding.writeUIntBE(pad, 0, padSize);
+    keylog('padding', padding);
+    ciphertext.push(gcm.update(padding));
+    ciphertext.push(gcm.update(buffer));
+
+    if (!last && padding.length + buffer.length < header.rs) {
+      throw new Error('Unable to pad to record size');
+    }
+  } else {
+    ciphertext.push(gcm.update(buffer));
+    padding.writeUIntBE(last ? 2 : 1, 0, 1);
+    keylog('padding', padding);
+    ciphertext.push(gcm.update(padding));
+  }
+
   gcm.final();
   var tag = gcm.getAuthTag();
   if (tag.length !== TAG_LENGTH) {
     throw new Error('invalid tag generated');
   }
-  return keylog('encrypted', Buffer.concat([epadding, ebuffer, tag]));
+  ciphertext.push(tag);
+  return keylog('encrypted', Buffer.concat(ciphertext));
 }
 
 function writeHeader(header) {
-  var ints = new Buffer(5);
+  var ints = Buffer.alloc(5);
   var keyid = Buffer.from(header.keyid || []);
   if (keyid.length > 255) {
     throw new Error('keyid is too large');
@@ -417,23 +447,16 @@ function writeHeader(header) {
  * size, which are described in the draft.
  *
  * |params.version| contains the version of encoding to use: aes128gcm is the latest,
- * but aesgcm and aesgcm128 are also accepted (though the latter two might
- * disappear in a future release).  If omitted, assume aesgcm, unless
- * |params.padSize| is set to 1, which means aesgcm128.
+ * but aesgcm is also accepted (though the latter two might
+ * disappear in a future release).  If omitted, assume aes128gcm.
  *
  * If |params.key| is specified, that value is used as the key.
  *
- * If |params.keyid| is specified without |params.dh|, the keyid value is used
- * to lookup the |params.keymap| for a buffer containing the key.
- *
  * For Diffie-Hellman (WebPush), |params.dh| includes the public key of the
- * receiver.  |params.privateKey| is used to establish a shared secret.  For
- * versions aesgcm and aesgcm128, if a private key is not provided, the ECDH key
- * pair used to encrypt is looked up using |params.keymap[params.keyid]|, and
- * |params.keymap| defaults to the values saved with saveKey().  Key pairs can
- * be created using |crypto.createECDH()|.
+ * receiver.  |params.privateKey| is used to establish a shared secret.  Key
+ * pairs can be created using |crypto.createECDH()|.
  */
-function encrypt(buffer, params) {
+function encrypt(buffer, params, keyLookupCallback) {  
   if (!Buffer.isBuffer(buffer)) {
     throw new Error('buffer argument must be a Buffer');
   }
@@ -444,53 +467,63 @@ function encrypt(buffer, params) {
 
   var result;
   if (header.version === 'aes128gcm') {
-    // Save the DH public key in the header.
+    // Save the DH public key in the header unless keyid is set.
     if (header.privateKey && !header.keyid) {
       header.keyid = header.privateKey.getPublicKey();
     }
     result = writeHeader(header);
   } else {
     // No header on other versions
-    result = new Buffer(0);
+    result = Buffer.alloc(0);
   }
 
-  var key = deriveKeyAndNonce(header, MODE_ENCRYPT);
+  var key = deriveKeyAndNonce(header, MODE_ENCRYPT, keyLookupCallback);
   var start = 0;
   var padSize = PAD_SIZE[header.version];
+  var overhead = padSize;
+  if (header.version === 'aes128gcm') {
+    overhead += TAG_LENGTH;
+  }
   var pad = isNaN(parseInt(params.pad, 10)) ? 0 : parseInt(params.pad, 10);
 
-  // Note the <= here ensures that we write out a padding-only block at the end
-  // of a buffer.
-  for (var i = 0; start <= buffer.length; ++i) {
+  var counter = 0;
+  var last = false;
+  while (!last) {
     // Pad so that at least one data byte is in a block.
-    var recordPad = Math.min((1 << (padSize * 8)) - 1, // maximum padding
-                             Math.min(header.rs - padSize - 1, pad));
+    var recordPad = Math.min(header.rs - overhead - 1, pad);
+    if (header.version !== 'aes128gcm') {
+      recordPad = Math.min((1 << (padSize * 8)) - 1, recordPad);
+    }
+    if (pad > 0 && recordPad === 0) {
+      ++recordPad; // Deal with perverse case of rs=overhead+1 with padding.
+    }
     pad -= recordPad;
 
-    var end = Math.min(start + header.rs - padSize - recordPad, buffer.length);
-    var block = encryptRecord(key, i, buffer.slice(start, end),
-                              recordPad, padSize);
+    var end = start + header.rs - overhead - recordPad;
+    if (header.version !== 'aes128gcm') {
+      // The > here ensures that we write out a padding-only block at the end
+      // of a buffer.
+      last = end > buffer.length;
+    } else {
+      last = end >= buffer.length;
+    }
+    last = last && pad <= 0;
+    var block = encryptRecord(key, counter, buffer.slice(start, end),
+                              recordPad, header, last);
     result = Buffer.concat([result, block]);
-    start += header.rs - padSize - recordPad;
-  }
-  if (pad) {
-    throw new Error('Unable to pad by requested amount, ' + pad + ' remaining');
+
+    start = end;
+    ++counter;
   }
   return result;
 }
 
-/**
- * Deprecated.  Use the keymap and keylabels arguments to encrypt()/decrypt().
- */
-function saveKey(id, key, dhLabel) {
-  saved.keymap[id] = key;
-  if (dhLabel) {
-    saved.keylabels[id] = dhLabel;
-  }
-}
+
+function isFunction(object) {
+  return typeof(object) === 'function';
+ }
 
 module.exports = {
   decrypt: decrypt,
-  encrypt: encrypt,
-  saveKey: saveKey
+  encrypt: encrypt
 };
