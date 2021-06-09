@@ -23,7 +23,6 @@ if (process.argv.length > 4) {
 }
 
 console.log("Params: " + JSON.stringify(params, null, 2));
-var result = ece.decrypt(base64.decode(process.argv[3]), params);
+var result = ece.encrypt(base64.decode(process.argv[3]), params);
 
-console.log(base64.encode(result));
-console.log(result.toString('utf-8'));
+console.log("Encrypted Message: " + base64.encode(result));
